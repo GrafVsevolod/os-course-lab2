@@ -86,7 +86,6 @@ static void fill_file_if_needed(const char *path, size_t file_pages) {
   if (posix_memalign(&buf, ps, ps) != 0) die("posix_memalign");
   memset(buf, 0xAB, ps);
 
-  /* extend by writing pages */
   for (size_t i = (size_t)(st.st_size / (off_t)ps); i < file_pages; i++) {
     off_t off = (off_t)(i * ps);
     ssize_t w = pwrite(fd, buf, ps, off);
@@ -103,11 +102,12 @@ static void fill_file_if_needed(const char *path, size_t file_pages) {
 static void usage(const char *argv0) {
   fprintf(stderr,
     "Usage:\n"
-    "  %s --mode=libc|vtpc --file=PATH --file-pages=N --ws-pages=N --ops=N [--seed=N]\n\n"
-    "Notes:\n"
-    "  - libc mode uses open+O_DIRECT (fallback if unsupported) + pread, no cache.\n"
-    "  - vtpc mode uses vtpc_* (your 2Q cache).\n"
-    "  - For cache size set env: VTPC_CACHE_PAGES (default 256).\n",
+    "  %s --mode=libc|vtpc|none --file=PATH --file-pages=N --ws-pages=N --ops=N [--seed=N]\n\n"
+    "Modes:\n"
+    "  libc : stdio (system page cache ON)\n"
+    "  vtpc : user 2Q cache, system cache OFF\n"
+    "  none : no user cache, system cache OFF\n\n"
+    "For vtpc cache size set env: VTPC_CACHE_PAGES (default 256).\n",
     argv0
   );
   exit(1);
@@ -132,11 +132,9 @@ int main(int argc, char **argv) {
   }
 
   if (!mode || !path) usage(argv[0]);
-  if (ws_pages == 0 || ops == 0 || file_pages == 0) usage(argv[0]);
   if (ws_pages > file_pages) ws_pages = file_pages;
 
   size_t ps = page_size();
-
   fill_file_if_needed(path, file_pages);
 
   void *buf = NULL;
@@ -144,22 +142,49 @@ int main(int argc, char **argv) {
 
   double t0 = now_sec();
 
+  /* ---------------- libc (system cache ON) ---------------- */
   if (strcmp(mode, "libc") == 0) {
-    int is_direct = 0;
-    int fd = open_direct_fallback(path, O_RDONLY, 0, &is_direct);
-    if (fd < 0) die("open libc");
+
+    FILE *f = fopen(path, "rb");
+    if (!f) die("fopen libc");
 
     for (size_t i = 0; i < ops; i++) {
       uint64_t r = xorshift64(&seed);
       uint64_t page = (r % ws_pages);
       off_t off = (off_t)(page * ps);
+
+      if (fseeko(f, off, SEEK_SET) != 0) die("fseeko libc");
+      size_t n = fread(buf, 1, ps, f);
+      if (n != ps) die("fread libc");
+    }
+
+    fclose(f);
+
+  /* ---------------- none (no cache at all) ---------------- */
+  } else if (strcmp(mode, "none") == 0) {
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) die("open none");
+
+#ifdef __APPLE__
+    if (fcntl(fd, F_NOCACHE, 1) != 0) die("fcntl F_NOCACHE none");
+#endif
+
+    for (size_t i = 0; i < ops; i++) {
+      uint64_t r = xorshift64(&seed);
+      uint64_t page = (r % ws_pages);
+      off_t off = (off_t)(page * ps);
+
       ssize_t n = pread(fd, buf, ps, off);
-      if (n < 0) die("pread libc");
-      if (n == 0) die("unexpected EOF");
+      if (n < 0) die("pread none");
+      if ((size_t)n != ps) die("short pread none");
     }
 
     close(fd);
+
+  /* ---------------- vtpc (user 2Q cache) ---------------- */
   } else if (strcmp(mode, "vtpc") == 0) {
+
     int fd = vtpc_open(path, O_RDONLY, 0);
     if (fd < 0) die("vtpc_open");
 
@@ -175,6 +200,7 @@ int main(int argc, char **argv) {
     }
 
     vtpc_close(fd);
+
   } else {
     usage(argv[0]);
   }
@@ -187,8 +213,10 @@ int main(int argc, char **argv) {
   double mbps = mb / dt;
   double ops_s = (double)ops / dt;
 
-  printf("mode=%s file_pages=%zu ws_pages=%zu ops=%zu page_size=%zu\n", mode, file_pages, ws_pages, ops, ps);
-  printf("time_sec=%.6f throughput_mib_s=%.2f ops_s=%.2f\n", dt, mbps, ops_s);
+  printf("mode=%s file_pages=%zu ws_pages=%zu ops=%zu page_size=%zu\n",
+         mode, file_pages, ws_pages, ops, ps);
+  printf("time_sec=%.6f throughput_mib_s=%.2f ops_s=%.2f\n",
+         dt, mbps, ops_s);
 
   free(buf);
   return 0;
