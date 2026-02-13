@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.12)
+
+project(
+    vtpc
+    VERSION 0.1
+    DESCRIPTION "VT Page Cache"
+)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+add_subdirectory(lib)
+add_subdirectory(test)
+
+add_executable(vtpc_bench bench/vtpc_bench.c)
+target_link_libraries(vtpc_bench PRIVATE vtpc)
